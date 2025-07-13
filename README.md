@@ -6,20 +6,23 @@ _Note: This is not a sample/learning/educational implementation. This is a full 
 ## Usage
 
 ```golang
-pool := gopool.New(gopool.WithNumWorkers(2))
+    pool := gopool.New(gopool.WithNumWorkers(2))
 
-resultChan, err := pool.Start()
+	resultChan, err := pool.Start()
 	
-go func() {
-	for result := range resultChan {
-		slog.Info("output reader", "result from pool", result.Result()) // process results 
+	go func() {
+		for result := range resultChan {
+			// process results 
+            slog.Info("output reader", "result from pool", result.Result())
+		}
+        // loop/ goroutine exits when resultChan is closed.
+	}()
+
+    // Submit 5 tasks
+	for i := range 5 {
+		pool.Submit(&sample.ATask{Message: fmt.Sprintf("task number %d", i)})
 	}
-  // loop/ goroutine exits when resultChan is closed.
-}()
 
-for i := range 5 { // Submit 5 tasks
-  err = pool.Submit(&sample.ATask{Message: fmt.Sprintf("task number %d", i)})
-}
-
-err = pool.Shutdown() // Shutdown pool, in flight tasks are processed.
+    // Shutdown pool, resultChan will be closed after in flight tasks are processed.
+    err = pool.Shutdown() 
 ```
