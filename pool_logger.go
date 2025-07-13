@@ -8,3 +8,15 @@ type PoolLogger interface {
 	Warn(msg string, args ...any)
 	Error(msg string, args ...any)
 }
+
+type NOOPLogger struct{}
+
+func (p *NOOPLogger) Debug(msg string, args ...any) {}
+
+func (p *NOOPLogger) Info(msg string, args ...any) {}
+
+func (p *NOOPLogger) Warn(msg string, args ...any) {}
+
+func (p *NOOPLogger) Error(msg string, args ...any) {}
+
+var _ PoolLogger = &NOOPLogger{}

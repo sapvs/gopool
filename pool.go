@@ -2,7 +2,8 @@
 package gopool
 
 import (
-	"log/slog"
+	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,12 @@ type pool struct {
 	l                                PoolLogger
 	running                          atomic.Bool
 	wg                               sync.WaitGroup
+	context                          context.Context
+}
+
+func (p *pool) String() string {
+	return fmt.Sprintf("go-pool {workers=%d, logger=%T, input buffer=%d, output buffer=%d }",
+		p.workers, p.l, p.taskChanBuffer, p.resultChanBuffer)
 }
 
 type option func(*pool)
@@ -24,7 +31,7 @@ func New(opts ...option) *pool {
 	// Default values
 	pool := &pool{
 		workers:          uint8(runtime.NumCPU()),
-		l:                slog.Default(),
+		l:                &NOOPLogger{},
 		taskChanBuffer:   uint(runtime.NumCPU()),
 		resultChanBuffer: uint(runtime.NumCPU()),
 	}
@@ -32,6 +39,9 @@ func New(opts ...option) *pool {
 	for _, opt := range opts {
 		opt(pool)
 	}
+
+	pool.l.Info("created worker pool", "pool config", pool.String())
+
 	return pool
 }
 
@@ -39,6 +49,13 @@ func New(opts ...option) *pool {
 func WithNumWorkers(workercount uint8) option {
 	return func(p *pool) {
 		p.workers = workercount
+	}
+}
+
+// WithContext context for this pool, may be used for cancellatins etc default nil
+func WithContext(poolCtx context.Context) option {
+	return func(p *pool) {
+		p.context = poolCtx
 	}
 }
 
@@ -65,18 +82,19 @@ func WithLogger(poolLogger PoolLogger) option {
 
 // Start Starts the pool workers. Returns the output channel and error if any
 func (p *pool) Start() (chan Result, error) {
-	p.tasksChan = make(chan Task, p.workers)
-	p.resultChan = make(chan Result, p.workers)
-
 	if p.running.Load() {
 		return nil, p.logAndReturnError(ERR_START_ON_RUNNING_POOL)
 	}
+
+	p.tasksChan = make(chan Task, p.workers)
+	p.resultChan = make(chan Result, p.workers)
 
 	for i := range p.workers {
 		p.wg.Add(1)
 		go p.work(i)
 	}
 
+	go p.monitorContext()
 	p.running.Store(true)
 	return p.resultChan, nil
 }
@@ -131,4 +149,19 @@ func (p *pool) work(goRoutineID uint8) {
 	}
 	p.l.Info("task channel closed", "routine", goRoutineID)
 	p.wg.Done()
+}
+
+func (p *pool) monitorContext() {
+	if p.context == nil {
+		p.l.Warn("nil context not monitoring cancel channel")
+		return
+	}
+
+	if cancelChan := p.context.Done(); cancelChan != nil {
+		<-cancelChan
+		p.l.Info("context done called, shutting down the pool")
+		p.Shutdown()
+	} else {
+		p.l.Warn("context has nil done channel, not monitoring context cancel")
+	}
 }
