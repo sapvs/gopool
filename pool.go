@@ -3,165 +3,105 @@ package gopool
 
 import (
 	"context"
-	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
 
-type pool struct {
-	tasksChan                        chan Task
-	resultChan                       chan Result
-	taskChanBuffer, resultChanBuffer uint
-	workers                          uint8
-	l                                PoolLogger
-	running                          atomic.Bool
-	wg                               sync.WaitGroup
-	context                          context.Context
-}
-
-func (p *pool) String() string {
-	return fmt.Sprintf("go-pool {workers=%d, logger=%T, input buffer=%d, output buffer=%d }",
-		p.workers, p.l, p.taskChanBuffer, p.resultChanBuffer)
-}
-
-type option func(*pool)
-
-func New(opts ...option) *pool {
-	// Default values
-	pool := &pool{
-		workers:          uint8(runtime.NumCPU()),
-		l:                &NOOPLogger{},
-		taskChanBuffer:   uint(runtime.NumCPU()),
-		resultChanBuffer: uint(runtime.NumCPU()),
-	}
-
-	for _, opt := range opts {
-		opt(pool)
-	}
-
-	pool.l.Info("created worker pool", "pool config", pool.String())
-
-	return pool
-}
-
-// WithNumWorkers configures number of goroutines to be available in this pool, default runtime.NumCPU
-func WithNumWorkers(workercount uint8) option {
-	return func(p *pool) {
-		p.workers = workercount
-	}
-}
-
-// WithContext context for this pool, may be used for cancellatins etc default nil
-func WithContext(poolCtx context.Context) option {
-	return func(p *pool) {
-		p.context = poolCtx
-	}
-}
-
-// WithInputChannelBuffer The size of task input queue, default runtime.NumCPU
-func WithInputChannelBuffer(buffer uint) option {
-	return func(p *pool) {
-		p.taskChanBuffer = buffer
-	}
-}
-
-// WithResultChannerBuffer The size of output queue, set this such the pool worker are not blocked returning the processing result default runtime.NumCPU
-func WithResultChannerBuffer(buffer uint) option {
-	return func(p *pool) {
-		p.resultChanBuffer = buffer
-	}
-}
-
-// WithLogger confure logger for the pool, implement PoolLogger interface for this.
-func WithLogger(poolLogger PoolLogger) option {
-	return func(p *pool) {
-		p.l = poolLogger
-	}
+type Pool struct {
+	PoolLogger
+	workChan   chan Work
+	resultChan chan Result
+	numWorkers uint
+	running    atomic.Bool
+	wg         sync.WaitGroup
+	poolCtx    context.Context
+	mu         sync.Mutex
 }
 
 // Start Starts the pool workers. Returns the output channel and error if any
-func (p *pool) Start() (chan Result, error) {
+func (p *Pool) Start() (chan Result, error) {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.running.Load() {
-		return nil, p.logAndReturnError(ERR_START_ON_RUNNING_POOL)
+		return nil, p.logErr(ERR_START_ON_RUNNING_POOL)
 	}
+	defer p.running.Store(true)
 
-	p.tasksChan = make(chan Task, p.workers)
-	p.resultChan = make(chan Result, p.workers)
-
-	for i := range p.workers {
+	for i := range p.numWorkers {
 		p.wg.Add(1)
 		go p.work(i)
 	}
 
 	go p.monitorContext()
-	p.running.Store(true)
+
 	return p.resultChan, nil
 }
 
 // Submit submits a Task to the pool, returns error if any
-func (p *pool) Submit(input Task) error {
+func (p *Pool) Submit(input Work) error {
 	if input == nil {
-		return p.logAndReturnError(ERR_NIL_TASK)
+		return p.logErr(ERR_NIL_WORK)
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if !p.running.Load() {
-		return p.logAndReturnError(ERR_SUBMIT_IN_CLOSED_POOL)
+		return p.logErr(ERR_SUBMIT_IN_CLOSED_POOL)
 	}
 
-	p.l.Debug("submitting task to pool")
-	p.tasksChan <- input
+	p.Debug("submitting task to pool")
+	p.workChan <- input
 	return nil
 
 }
 
 // Shutdown Shuts down the pool workers, currently only graceful shutdown is supported.
 // In-flight taks are processed and results returned before pool shutdown
-func (p *pool) Shutdown() error {
-
+func (p *Pool) Shutdown() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if !p.running.Load() {
-		return p.logAndReturnError(ERR_STOP_ON_CLOSED_POOL)
+		return p.logErr(ERR_STOP_ON_CLOSED_POOL)
 	}
-
-	// TODO should need some mutex here?
-	p.running.Store(false)
-
-	p.l.Info("shutting down")
-	close(p.tasksChan)
-
-	p.l.Info("waiting for workers to finish")
+	defer p.running.Store(false)
+	p.Info("shutting down")
+	close(p.workChan)
+	p.Info("waiting for workers to finish")
 	p.wg.Wait()
-	p.l.Info("all workers finished, closing result channel")
+	p.Info("all workers finished, closing result channel")
 	close(p.resultChan)
-	p.l.Info("Done")
+	p.Info("Done")
+
 	return nil
 }
 
-func (p *pool) logAndReturnError(err error) error {
-	p.l.Warn(err.Error())
+func (p *Pool) logErr(err error) error {
+	p.Warn(err.Error())
 	return err
 }
 
-func (p *pool) work(goRoutineID uint8) {
-	for tasks := range p.tasksChan {
-		result := tasks.Do()
+func (p *Pool) work(goRoutineID uint) {
+	for work := range p.workChan {
+		result := work.Do()
 		p.resultChan <- result
 	}
-	p.l.Info("task channel closed", "routine", goRoutineID)
+	p.Info("task channel closed", "routine", goRoutineID)
 	p.wg.Done()
 }
 
-func (p *pool) monitorContext() {
-	if p.context == nil {
-		p.l.Warn("nil context not monitoring cancel channel")
+func (p *Pool) monitorContext() {
+	if p.poolCtx == nil || p.poolCtx.Done() == nil {
+		p.Warn("nil context not monitoring cancel channel")
 		return
 	}
 
-	if cancelChan := p.context.Done(); cancelChan != nil {
-		<-cancelChan
-		p.l.Info("context done called, shutting down the pool")
-		p.Shutdown()
-	} else {
-		p.l.Warn("context has nil done channel, not monitoring context cancel")
+	<-p.poolCtx.Done()
+
+	p.Info("context done called, shutting down the pool")
+	if err := p.Shutdown(); err != nil {
+		p.Info("could not shutdown pool", "err", err)
 	}
 }
