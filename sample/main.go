@@ -5,26 +5,26 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/sapvs/gopool"
 )
 
 func main() {
+
+	var err error
+	fmt.Printf("err: %v\n", err)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	pool := gopool.New(gopool.WithNumWorkers(2),
 		gopool.WithContext(ctx),
 		gopool.WithLogger(slog.Default()))
 
-	resultChan, err := pool.Start()
-	if err != nil {
-		return
-	}
+	resultChan, _ := pool.Start()
 
 	go func() {
 		for result := range resultChan {
-			slog.Info("output reader", "result from pool", result.Result())
+			slog.Info("result from pool", "result", result.Get())
 		}
 	}()
 
@@ -36,12 +36,9 @@ func main() {
 		}
 	}
 
-	cancel() // OR with pool.Shutdown()
-	if err != nil {
-		slog.Info("", "err", err)
-	}
-
-	time.Sleep(2 * time.Second)
+	pool.Shutdown()
+	pool.Submit(&ATask{})
+	// time.Sleep(2 * time.Second)
 
 }
 
@@ -57,6 +54,6 @@ type AResult struct {
 	result string
 }
 
-func (p *AResult) Result() any {
+func (p *AResult) Get() any {
 	return p.result
 }
