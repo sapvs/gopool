@@ -54,25 +54,33 @@ func TestProcessing(t *testing.T) {
 	t.Parallel()
 
 	var tasks int64 = 10_000
-	var count atomic.Int64
+	var received atomic.Int64
+	var resultMut sync.Mutex
+	var wg sync.WaitGroup
 
 	p := New(WithNumWorkers(10), WithResultBuffer(20), WithWorkBuffer(30))
 	result, err := p.Start()
 	assert.NoError(t, err, "error in pool start")
 
-	go func(res chan Result, c *atomic.Int64) {
-		for range res {
-			c.Add(1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range result {
+			func() {
+				resultMut.Lock()
+				defer resultMut.Unlock()
+				received.Add(1)
+			}()
 		}
-	}(result, &count)
+	}()
 
 	for range tasks {
 		assert.NoError(t, p.Submit(&TestTask{}), "error submit")
 	}
 
 	assert.NoError(t, p.Shutdown(), "error in pool stop")
-	assert.Equal(t, tasks, count.Load(), "submitted tasks not equal")
-
+	wg.Wait()
+	assert.Equal(t, tasks, received.Load(), "submitted tasks not equal")
 }
 
 type TestTask struct{}
@@ -145,4 +153,54 @@ func TestCancelWithContext(t *testing.T) {
 	assert.NoError(t, p.Shutdown())
 
 	cancel()
+}
+
+var pool *Pool
+
+func BenchmarkPoolNew(b *testing.B) {
+	for b.Loop() {
+		pool = New(WithNumWorkers(10),
+			WithContext(context.TODO()),
+			WithWorkBuffer(100),
+			WithResultBuffer(100),
+			WithLogger(&NOOPLogger{}))
+		_, err := pool.Start()
+		if err != nil {
+			b.Fail()
+		}
+		err = pool.Shutdown()
+		if err != nil {
+			b.Fail()
+		}
+
+	}
+}
+
+func BenchmarkPoolNewParallel(b *testing.B) {
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			poolp := New(WithNumWorkers(10),
+				WithContext(context.TODO()),
+				WithWorkBuffer(100),
+				WithResultBuffer(100),
+				WithLogger(&NOOPLogger{}))
+			_, err := poolp.Start()
+			if err != nil {
+				b.Fail()
+			}
+			err = poolp.Shutdown()
+			if err != nil {
+				b.Fail()
+			}
+		}
+	})
+}
+
+func BenchmarkPoolStart(b *testing.B) {
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			b.Log("in next")
+
+		}
+	})
 }
